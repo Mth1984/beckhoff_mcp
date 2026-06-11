@@ -591,6 +591,7 @@ CONNECTION_TOOL_ANNOTATIONS = {
 def beckhoff_discover_and_connect(
     ctx: Context,
     ip_address: str,
+    ams_net_id: str | None = None,
     username: str | None = None,
     password: str | None = None,
     ams_port: int = 851,
@@ -598,12 +599,16 @@ def beckhoff_discover_and_connect(
 ) -> dict[str, Any]:
     """Discover and connect to a remote Beckhoff PLC by IP address.
 
-    Uses UDP discovery (port 48899) to find the PLC's AMS Net ID and optionally
-    adds an ADS route. Replaces the current PLC connection with the new one
-    and re-caches all symbols.
+    If ams_net_id is provided, UDP discovery is skipped and the given AMS Net ID
+    is used directly (required when UDP port 48899 is blocked but an ADS route
+    already exists). Otherwise uses UDP discovery (port 48899) to find the PLC's
+    AMS Net ID. Replaces the current PLC connection and re-caches all symbols.
 
     Args:
         ip_address: IP address of the target PLC (e.g., "192.168.1.54")
+        ams_net_id: Known AMS Net ID (e.g., "192.168.12.2.1.1"). When set, UDP
+            discovery is skipped — use this when an ADS route already exists and
+            UDP 48899 is firewalled.
         username: PLC login username for route creation (optional)
         password: PLC login password for route creation (optional)
         ams_port: ADS port number (default 851 for PLC Runtime 1)
@@ -616,23 +621,26 @@ def beckhoff_discover_and_connect(
     state: AppState = ctx.request_context.lifespan_context
     old_plc = state.plc
 
-    # Step 1: Discover AMS Net ID via UDP
-    try:
-        # Use pyads_ex submodule which has the discovery function
-        from pyads.pyads_ex import adsGetNetIdForPLC
-        discovered_ams_net_id = adsGetNetIdForPLC(ip_address)
-    except ImportError:
-        return {
-            "success": False,
-            "error": "UDP discovery not available in this pyads version",
-            "hint": "Update pyads to 3.3.0+ or provide AMS Net ID directly",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"UDP discovery failed for {ip_address}: {e}",
-            "hint": "Ensure the PLC is reachable and UDP port 48899 is not blocked",
-        }
+    # Step 1: Resolve AMS Net ID — use provided one (skip UDP) or discover via UDP
+    if ams_net_id:
+        discovered_ams_net_id = ams_net_id
+    else:
+        try:
+            # Use pyads_ex submodule which has the discovery function
+            from pyads.pyads_ex import adsGetNetIdForPLC
+            discovered_ams_net_id = adsGetNetIdForPLC(ip_address)
+        except ImportError:
+            return {
+                "success": False,
+                "error": "UDP discovery not available in this pyads version",
+                "hint": "Update pyads to 3.3.0+ or pass ams_net_id directly",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"UDP discovery failed for {ip_address}: {e}",
+                "hint": "UDP 48899 may be blocked — pass ams_net_id directly if an ADS route exists",
+            }
 
     # Step 2: Add route to PLC if credentials provided (Linux only)
     route_added = False
