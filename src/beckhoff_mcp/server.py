@@ -1,4 +1,8 @@
-"""Beckhoff PLC MCP Server - Read-only access to TwinCAT PLCs via ADS."""
+"""Beckhoff PLC MCP Server - TwinCAT access via ADS.
+
+Reading is always available. Writing is OFF by default and guarded by three
+layers (global switch, whitelist, hard blacklist) - see "Write Protection".
+"""
 
 import fnmatch
 import os
@@ -86,6 +90,87 @@ TOOL_ANNOTATIONS = {
     "idempotentHint": True,
     "openWorldHint": False,
 }
+
+WRITE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+
+# ==============================================================================
+# Write Protection
+#
+# HART: Ein Schreibzugriff auf eine SPS bewegt echte Hardware - Ventile,
+# Achsen, Freigaben. Deshalb drei Schutzschichten, alle standardmaessig zu:
+#   1. Globaler Schalter (Default AUS)
+#   2. Whitelist (Default leer = nichts erlaubt)
+#   3. Blacklist, die die Whitelist immer schlaegt
+# ==============================================================================
+
+# Schicht 1: Schreiben ist aus, bis es explizit eingeschaltet wird.
+WRITE_ENABLED = os.environ.get("BECKHOFF_MCP_ALLOW_WRITE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Schicht 2: Nur Symbole, die auf eines dieser fnmatch-Muster passen, duerfen
+# beschrieben werden. Komma-getrennt. Leer = nichts erlaubt.
+WRITE_WHITELIST = [
+    p.strip()
+    for p in os.environ.get("BECKHOFF_MCP_WRITE_WHITELIST", "").split(",")
+    if p.strip()
+]
+
+# Schicht 3: Harte Sperre. Schlaegt IMMER die Whitelist, auch bei exaktem
+# Treffer. Diese Symbole haengen an Hardware oder an der Sicherheitskette.
+WRITE_BLACKLIST = [
+    "*.oQ", "*.oQ.*",              # HW-Ausgaenge: Ventile, Lampen, Freigaben
+    "*.iIn", "*.iIn.*",            # HW-Eingaenge: physikalisch belegt
+    "*.iValue", "*.iValue.*",      # HW-Analogeingaenge
+    "*Safety*", "*SAFETY*", "*safety*",
+    "*Sicherheit*", "*Sicherung*",
+    "*NotHalt*", "*NotAus*", "*NotStop*",
+    "*.PlcToNc*",                  # NC-Achskommandos - faehrt echte Achsen
+    "*mValve*", "*mVentil*",       # Ventilbausteine
+]
+
+
+def check_write_allowed(symbol_name: str) -> str | None:
+    """Prueft, ob ein Symbol beschrieben werden darf.
+
+    Returns:
+        None wenn erlaubt, sonst der Ablehnungsgrund im Klartext.
+    """
+    if not WRITE_ENABLED:
+        return (
+            "Schreibzugriff ist deaktiviert (Default). Zum Aktivieren die "
+            "Umgebungsvariable BECKHOFF_MCP_ALLOW_WRITE=1 im MCP-Eintrag setzen "
+            "und Claude Code neu starten."
+        )
+
+    for pattern in WRITE_BLACKLIST:
+        if fnmatch.fnmatch(symbol_name, pattern):
+            return (
+                f"Symbol '{symbol_name}' ist hart gesperrt (Muster '{pattern}'). "
+                "HW-Ein-/Ausgaenge, Sicherheitskette und NC-Kommandos sind "
+                "grundsaetzlich nicht beschreibbar - auch nicht per Whitelist."
+            )
+
+    if not WRITE_WHITELIST:
+        return (
+            "Keine Write-Whitelist konfiguriert. BECKHOFF_MCP_WRITE_WHITELIST auf "
+            "fnmatch-Muster setzen, z.B. 'GVL_Anim.*,MAIN.stHmi.*'."
+        )
+
+    if not any(fnmatch.fnmatch(symbol_name, p) for p in WRITE_WHITELIST):
+        return (
+            f"Symbol '{symbol_name}' passt auf kein Whitelist-Muster "
+            f"({', '.join(WRITE_WHITELIST)})."
+        )
+
+    return None
 
 # ==============================================================================
 # EtherCAT Constants
@@ -579,6 +664,120 @@ def beckhoff_read_variables(ctx: Context, symbol_names: list[str]) -> dict[str, 
 
 
 # Tool annotations for connection management tools (not read-only)
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
+def beckhoff_write_variable(
+    ctx: Context, symbol_name: str, value: Any, verify: bool = True
+) -> dict[str, Any]:
+    """Write a single PLC variable by symbol name.
+
+    ⚠️ Writing to a PLC moves real hardware. Guarded by three layers, all
+    closed by default: a global switch (BECKHOFF_MCP_ALLOW_WRITE), a whitelist
+    (BECKHOFF_MCP_WRITE_WHITELIST) and a hard blacklist that always wins.
+    HW inputs/outputs, the safety chain and NC commands can never be written.
+
+    Args:
+        symbol_name: Full symbol name (e.g., "GVL_Anim.fAxisX").
+        value: The value to write. Must match the symbol's PLC type.
+        verify: Read the value back after writing and report both (default True).
+
+    Returns the written value, the read-back value and whether they match.
+    """
+    state: AppState = ctx.request_context.lifespan_context
+
+    if not state.connected or state.plc is None:
+        return {
+            "error": "Not connected to a PLC",
+            "hint": "Use beckhoff_discover_and_connect to connect to a PLC first",
+        }
+
+    denial = check_write_allowed(symbol_name)
+    if denial:
+        return {"error": "Write denied", "reason": denial, "symbol": symbol_name}
+
+    symbol = state.symbols.get(symbol_name)
+    if not symbol:
+        try:
+            symbol = state.plc.get_symbol(symbol_name)
+        except pyads.ADSError as e:
+            return {"error": f"Symbol '{symbol_name}' not found: {e}"}
+
+    try:
+        plc_type = get_plc_type(symbol.symbol_type)
+    except ValueError:
+        return {
+            "error": f"Complex type '{symbol.symbol_type}' is not writable via this tool",
+            "hint": "Write individual struct members instead",
+        }
+
+    before = None
+    try:
+        before = state.plc.read_by_name(symbol_name, plc_type)
+    except pyads.ADSError:
+        pass  # Vorher-Wert ist optional, kein Abbruchgrund
+
+    try:
+        state.plc.write_by_name(symbol_name, value, plc_type)
+    except pyads.ADSError as e:
+        return {"error": f"Failed to write '{symbol_name}': {e}"}
+    except (TypeError, ValueError) as e:
+        return {
+            "error": f"Value {value!r} does not fit type '{symbol.symbol_type}': {e}"
+        }
+
+    # Audit-Spur auf stderr - taucht im MCP-Log auf, nicht im Tool-Result
+    print(
+        f"[beckhoff-mcp][WRITE] {symbol_name} ({symbol.symbol_type}): "
+        f"{before!r} -> {value!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    result: dict[str, Any] = {
+        "name": symbol_name,
+        "type": symbol.symbol_type,
+        "value_before": before,
+        "value_written": value,
+    }
+
+    if verify:
+        try:
+            readback = state.plc.read_by_name(symbol_name, plc_type)
+            result["value_readback"] = readback
+            result["verified"] = readback == value
+        except pyads.ADSError as e:
+            result["verified"] = False
+            result["verify_error"] = str(e)
+
+    return result
+
+
+@mcp.tool(annotations=TOOL_ANNOTATIONS)
+def beckhoff_write_status(ctx: Context) -> dict[str, Any]:
+    """Report whether PLC writing is enabled and which symbols are permitted.
+
+    Read-only. Use this to check the guard configuration before attempting
+    a write, without triggering one.
+    """
+    return {
+        "write_enabled": WRITE_ENABLED,
+        "whitelist": WRITE_WHITELIST or None,
+        "blacklist_patterns": WRITE_BLACKLIST,
+        "effective": (
+            "Writing possible for whitelisted symbols"
+            if WRITE_ENABLED and WRITE_WHITELIST
+            else "Writing blocked"
+        ),
+        "how_to_enable": {
+            "env": {
+                "BECKHOFF_MCP_ALLOW_WRITE": "1",
+                "BECKHOFF_MCP_WRITE_WHITELIST": "GVL_Anim.*,MAIN.stHmi.*",
+            },
+            "where": "~/.claude.json -> mcpServers -> beckhoff-ads -> env",
+            "note": "Claude Code neu starten, damit der MCP-Server die Env sieht",
+        },
+    }
+
+
 CONNECTION_TOOL_ANNOTATIONS = {
     "readOnlyHint": False,
     "destructiveHint": False,
